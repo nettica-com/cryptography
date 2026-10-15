@@ -17,10 +17,12 @@ package dev.dint.cryptography_flutter
 import android.os.Build
 import androidx.annotation.RequiresApi
 import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
+import io.flutter.plugin.common.StandardMethodCodec
 import java.math.BigInteger
 import java.security.*
 import java.security.interfaces.*
@@ -33,7 +35,15 @@ class CryptographyFlutterPlugin : FlutterPlugin, MethodCallHandler {
     private lateinit var channel: MethodChannel
 
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
-        channel = MethodChannel(flutterPluginBinding.binaryMessenger, "cryptography_flutter")
+        val messenger = flutterPluginBinding.binaryMessenger
+        // Off the main thread: bulk encrypt/decrypt of megabyte buffers there
+        // blocked input and stalled on GC for as long as each call took.
+        // Concurrent, since every call builds its own Cipher/Mac/KeyFactory and
+        // shares no state, so parallel chunks run on separate cores.
+        val taskQueue = messenger.makeBackgroundTaskQueue(
+            BinaryMessenger.TaskQueueOptions().setIsSerial(false)
+        )
+        channel = MethodChannel(messenger, "cryptography_flutter", StandardMethodCodec.INSTANCE, taskQueue)
         channel.setMethodCallHandler(this)
     }
 
