@@ -14,6 +14,7 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' show min;
 
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter/foundation.dart';
@@ -47,6 +48,11 @@ abstract class FlutterCipher
   /// platform but Android — so later calls go straight to the method channel.
   static bool _rawDecryptMissing = false;
 
+  /// The same for encrypt, which a send does once per chunk.
+  static const _encryptChannel = 'cryptography_flutter/encrypt';
+
+  static bool _rawEncryptMissing = false;
+
   static const _statusOk = 0;
   static const _statusIncorrectMac = 1;
   static const _statusIncorrectPadding = 2;
@@ -62,9 +68,46 @@ abstract class FlutterCipher
     required Uint8List mac,
   }) async {
     if (_rawDecryptMissing) return null;
+    final reply = await _sendRaw(_decryptChannel, name, secretKey, nonce, aad, [cipherText, mac]);
+    if (reply == null) {
+      _rawDecryptMissing = true;
+      return null;
+    }
+    return _rawReplyBody(reply, 'DECRYPT_FAILED');
+  }
+
+  /// The cipher text followed by its mac, or null where the platform has no
+  /// raw encrypt handler.
+  static Future<Uint8List?> _encryptRaw({
+    required String name,
+    required Uint8List secretKey,
+    required Uint8List nonce,
+    required Uint8List aad,
+    required List<int> clearText,
+  }) async {
+    if (_rawEncryptMissing) return null;
+    final reply = await _sendRaw(_encryptChannel, name, secretKey, nonce, aad, [clearText]);
+    if (reply == null) {
+      _rawEncryptMissing = true;
+      return null;
+    }
+    return _rawReplyBody(reply, 'ENCRYPT_FAILED');
+  }
+
+  /// Request, big-endian: algorithm name, key and nonce each behind a one-byte
+  /// length, aad behind a four-byte length, then [payload] back to back.
+  static Future<ByteData?> _sendRaw(
+    String channel,
+    String name,
+    Uint8List secretKey,
+    Uint8List nonce,
+    Uint8List aad,
+    List<List<int>> payload,
+  ) async {
     final nameBytes = utf8.encode(name);
+    final payloadLength = payload.fold<int>(0, (sum, part) => sum + part.length);
     final request = Uint8List(
-      1 + nameBytes.length + 1 + secretKey.length + 1 + nonce.length + 4 + aad.length + cipherText.length + mac.length,
+      1 + nameBytes.length + 1 + secretKey.length + 1 + nonce.length + 4 + aad.length + payloadLength,
     );
     var i = 0;
     void put(List<int> bytes) {
@@ -81,14 +124,13 @@ abstract class FlutterCipher
     ByteData.sublistView(request).setUint32(i, aad.length);
     i += 4;
     put(aad);
-    put(cipherText);
-    put(mac);
+    payload.forEach(put);
 
-    final reply = await ServicesBinding.instance.defaultBinaryMessenger.send(_decryptChannel, ByteData.sublistView(request));
-    if (reply == null) {
-      _rawDecryptMissing = true;
-      return null;
-    }
+    return await ServicesBinding.instance.defaultBinaryMessenger.send(channel, ByteData.sublistView(request));
+  }
+
+  /// Reply: a status byte, then the output or a UTF-8 message.
+  static Uint8List _rawReplyBody(ByteData reply, String failureCode) {
     final body = Uint8List.sublistView(reply, 1);
     switch (reply.getUint8(0)) {
       case _statusOk:
@@ -100,7 +142,7 @@ abstract class FlutterCipher
       case _statusUnsupported:
         throw UnsupportedError(utf8.decode(body));
       default:
-        throw PlatformException(code: 'DECRYPT_FAILED', message: utf8.decode(body));
+        throw PlatformException(code: failureCode, message: utf8.decode(body));
     }
   }
 
@@ -260,20 +302,37 @@ abstract class FlutterCipher
       size: clearTextSize,
     );
     await lock.lock();
-    Map result;
+    late Uint8List cipherText;
+    late Uint8List macBytes;
     try {
-      final clearTextUint8List = asUint8List(clearText);
-      result = await invokeMethod(
-        'encrypt',
-        {
-          'algo': name,
-          'data': clearTextUint8List,
-          'key': secretKeyUint8List,
-          'nonce': nonceUint8List,
-          'aad': aadUint8List,
-        },
-        useQueue: false, // We do queueing ourselves
+      final raw = await _encryptRaw(
+        name: name,
+        secretKey: secretKeyUint8List,
+        nonce: nonceUint8List,
+        aad: aadUint8List,
+        clearText: clearText,
       );
+      if (raw != null) {
+        // Short output is left for the sanity check below to report.
+        final split = min(raw.length, cipher.cipherTextLength(clearTextSize));
+        cipherText = Uint8List.sublistView(raw, 0, split);
+        macBytes = Uint8List.sublistView(raw, split);
+      } else {
+        final clearTextUint8List = asUint8List(clearText);
+        final Map result = await invokeMethod(
+          'encrypt',
+          {
+            'algo': name,
+            'data': clearTextUint8List,
+            'key': secretKeyUint8List,
+            'nonce': nonceUint8List,
+            'aad': aadUint8List,
+          },
+          useQueue: false, // We do queueing ourselves
+        );
+        cipherText = result['cipherText'] as Uint8List;
+        macBytes = result['mac'] as Uint8List;
+      }
     } on UnsupportedError {
       if (fallback == null) {
         rethrow;
@@ -288,8 +347,6 @@ abstract class FlutterCipher
       lock.unlock();
     }
 
-    final cipherText = result['cipherText'] as Uint8List;
-
     // Sanity check
     if (cipherText.length != cipher.cipherTextLength(clearTextSize)) {
       throw StateError(
@@ -299,7 +356,6 @@ abstract class FlutterCipher
       );
     }
 
-    final macBytes = result['mac'] as Uint8List;
     return SecretBox(
       cipherText,
       nonce: nonce,

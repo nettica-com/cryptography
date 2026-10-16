@@ -52,11 +52,17 @@ class CryptographyFlutterPlugin : FlutterPlugin, MethodCallHandler {
             { message, reply -> reply.reply(decryptRaw(message)) },
             taskQueue
         )
+        messenger.setMessageHandler(
+            ENCRYPT_CHANNEL,
+            { message, reply -> reply.reply(encryptRaw(message)) },
+            taskQueue
+        )
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
         binding.binaryMessenger.setMessageHandler(DECRYPT_CHANNEL, null)
+        binding.binaryMessenger.setMessageHandler(ENCRYPT_CHANNEL, null)
     }
 
     companion object {
@@ -64,6 +70,9 @@ class CryptographyFlutterPlugin : FlutterPlugin, MethodCallHandler {
         /// payload into growing Java arrays on the way in and again on the way
         /// out, which at transfer speeds is gigabytes of garbage per gigabyte.
         private const val DECRYPT_CHANNEL = "cryptography_flutter/decrypt"
+
+        /// The same for bulk AEAD encrypt, which sends do once per chunk.
+        private const val ENCRYPT_CHANNEL = "cryptography_flutter/encrypt"
 
         private const val STATUS_OK: Byte = 0
         private const val STATUS_INCORRECT_MAC: Byte = 1
@@ -111,6 +120,39 @@ class CryptographyFlutterPlugin : FlutterPlugin, MethodCallHandler {
             return status(STATUS_INCORRECT_MAC, e.message)
         } catch (e: BadPaddingException) {
             return status(STATUS_INCORRECT_PADDING, e.message)
+        } catch (e: Throwable) {
+            return status(STATUS_ERROR, e.toString())
+        }
+    }
+
+    /// [decryptRaw]'s request layout with the clear text in place of cipher
+    /// text and mac. Reply: a status byte, then the cipher text followed by its
+    /// mac, or a UTF-8 message.
+    private fun encryptRaw(message: ByteBuffer?): ByteBuffer {
+        try {
+            val input = message?.order(ByteOrder.BIG_ENDIAN) ?: return status(STATUS_ERROR, "Empty request")
+            val dartAlgo = String(bytes(input, input.get().toInt() and 0xff), Charsets.UTF_8)
+            val secretKey = bytes(input, input.get().toInt() and 0xff)
+            val nonce = bytes(input, input.get().toInt() and 0xff)
+            val aad = bytes(input, input.int)
+            val androidAlgo = androidCipherAlgo(dartAlgo)
+            val macLength = cipherMacLength(dartAlgo)
+            if (androidAlgo == null || macLength == null) {
+                return status(STATUS_UNSUPPORTED, "cryptography_flutter does not support algorithm $dartAlgo in Android.")
+            }
+            val cipher = try {
+                Cipher.getInstance(androidAlgo)
+            } catch (error: NoSuchAlgorithmException) {
+                return status(STATUS_UNSUPPORTED, "Your version of Android does not support $androidAlgo.")
+            }
+            val params = if (dartAlgo == "AES_GCM") GCMParameterSpec(macLength * 8, nonce) else IvParameterSpec(nonce)
+            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(secretKey, androidAlgo), params)
+            if (aad.isNotEmpty()) cipher.updateAAD(aad)
+
+            val output = ByteBuffer.allocateDirect(1 + cipher.getOutputSize(input.remaining()))
+            output.put(STATUS_OK)
+            cipher.doFinal(input, output)
+            return output
         } catch (e: Throwable) {
             return status(STATUS_ERROR, e.toString())
         }
