@@ -24,6 +24,8 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import io.flutter.plugin.common.StandardMethodCodec
 import java.math.BigInteger
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.*
 import java.security.interfaces.*
 import java.security.spec.*
@@ -45,10 +47,80 @@ class CryptographyFlutterPlugin : FlutterPlugin, MethodCallHandler {
         )
         channel = MethodChannel(messenger, "cryptography_flutter", StandardMethodCodec.INSTANCE, taskQueue)
         channel.setMethodCallHandler(this)
+        messenger.setMessageHandler(
+            DECRYPT_CHANNEL,
+            { message, reply -> reply.reply(decryptRaw(message)) },
+            taskQueue
+        )
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
+        binding.binaryMessenger.setMessageHandler(DECRYPT_CHANNEL, null)
+    }
+
+    companion object {
+        /// Bulk AEAD decrypt over raw bytes. The method channel's codec copies a
+        /// payload into growing Java arrays on the way in and again on the way
+        /// out, which at transfer speeds is gigabytes of garbage per gigabyte.
+        private const val DECRYPT_CHANNEL = "cryptography_flutter/decrypt"
+
+        private const val STATUS_OK: Byte = 0
+        private const val STATUS_INCORRECT_MAC: Byte = 1
+        private const val STATUS_INCORRECT_PADDING: Byte = 2
+        private const val STATUS_UNSUPPORTED: Byte = 3
+        private const val STATUS_ERROR: Byte = 4
+    }
+
+    /// Request, big-endian: algorithm name, key and nonce each behind a one-byte
+    /// length, aad behind a four-byte length, then the cipher text followed by
+    /// its mac. Reply: a status byte, then the clear text, or a UTF-8 message.
+    ///
+    /// The reply's length is its position, which is how Flutter reads it.
+    private fun decryptRaw(message: ByteBuffer?): ByteBuffer {
+        try {
+            val input = message?.order(ByteOrder.BIG_ENDIAN) ?: return status(STATUS_ERROR, "Empty request")
+            val dartAlgo = String(bytes(input, input.get().toInt() and 0xff), Charsets.UTF_8)
+            val secretKey = bytes(input, input.get().toInt() and 0xff)
+            val nonce = bytes(input, input.get().toInt() and 0xff)
+            val aad = bytes(input, input.int)
+            val androidAlgo = androidCipherAlgo(dartAlgo)
+            val macLength = cipherMacLength(dartAlgo)
+            if (androidAlgo == null || macLength == null) {
+                return status(STATUS_UNSUPPORTED, "cryptography_flutter does not support algorithm $dartAlgo in Android.")
+            }
+            if (input.remaining() < macLength) return status(STATUS_INCORRECT_MAC, "Shorter than its mac")
+            val cipher = try {
+                Cipher.getInstance(androidAlgo)
+            } catch (error: NoSuchAlgorithmException) {
+                return status(STATUS_UNSUPPORTED, "Your version of Android does not support $androidAlgo.")
+            }
+            val params = if (dartAlgo == "AES_GCM") GCMParameterSpec(macLength * 8, nonce) else IvParameterSpec(nonce)
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(secretKey, androidAlgo), params)
+            if (aad.isNotEmpty()) cipher.updateAAD(aad)
+
+            // Direct, so the clear text never lands on the Java heap. Sized for
+            // the whole input in case a provider asks for room for the mac too.
+            val output = ByteBuffer.allocateDirect(1 + input.remaining())
+            output.put(STATUS_OK)
+            // One call over cipher text and mac together: separate update()
+            // calls make the cipher hold its own growing copy until the tag.
+            cipher.doFinal(input, output)
+            return output
+        } catch (e: AEADBadTagException) {
+            return status(STATUS_INCORRECT_MAC, e.message)
+        } catch (e: BadPaddingException) {
+            return status(STATUS_INCORRECT_PADDING, e.message)
+        } catch (e: Throwable) {
+            return status(STATUS_ERROR, e.toString())
+        }
+    }
+
+    private fun bytes(buffer: ByteBuffer, length: Int): ByteArray = ByteArray(length).also { buffer.get(it) }
+
+    private fun status(code: Byte, message: String?): ByteBuffer {
+        val text = (message ?: "").toByteArray(Charsets.UTF_8)
+        return ByteBuffer.allocateDirect(1 + text.size).put(code).put(text)
     }
 
     override fun onMethodCall(call: MethodCall, result: Result) {

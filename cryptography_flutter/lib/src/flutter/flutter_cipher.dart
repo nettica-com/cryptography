@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter/foundation.dart';
@@ -36,6 +37,72 @@ abstract class FlutterCipher
     // A too high value causes crashes on Android.
     maxLength: CryptographyChannelQueue.defaultInstance.maxConcurrentSize,
   );
+
+  /// Raw-bytes decrypt (see `decryptRaw` in the Android plugin): one request
+  /// buffer, and clear text read straight out of the reply, where the method
+  /// channel's codec copies both into growing buffers on each side.
+  static const _decryptChannel = 'cryptography_flutter/decrypt';
+
+  /// Set once a platform turns out to have no raw decrypt handler — every
+  /// platform but Android — so later calls go straight to the method channel.
+  static bool _rawDecryptMissing = false;
+
+  static const _statusOk = 0;
+  static const _statusIncorrectMac = 1;
+  static const _statusIncorrectPadding = 2;
+  static const _statusUnsupported = 3;
+
+  /// Null where the platform has no raw decrypt handler.
+  static Future<Uint8List?> _decryptRaw({
+    required String name,
+    required Uint8List secretKey,
+    required Uint8List nonce,
+    required Uint8List aad,
+    required List<int> cipherText,
+    required Uint8List mac,
+  }) async {
+    if (_rawDecryptMissing) return null;
+    final nameBytes = utf8.encode(name);
+    final request = Uint8List(
+      1 + nameBytes.length + 1 + secretKey.length + 1 + nonce.length + 4 + aad.length + cipherText.length + mac.length,
+    );
+    var i = 0;
+    void put(List<int> bytes) {
+      request.setAll(i, bytes);
+      i += bytes.length;
+    }
+
+    request[i++] = nameBytes.length;
+    put(nameBytes);
+    request[i++] = secretKey.length;
+    put(secretKey);
+    request[i++] = nonce.length;
+    put(nonce);
+    ByteData.sublistView(request).setUint32(i, aad.length);
+    i += 4;
+    put(aad);
+    put(cipherText);
+    put(mac);
+
+    final reply = await ServicesBinding.instance.defaultBinaryMessenger.send(_decryptChannel, ByteData.sublistView(request));
+    if (reply == null) {
+      _rawDecryptMissing = true;
+      return null;
+    }
+    final body = Uint8List.sublistView(reply, 1);
+    switch (reply.getUint8(0)) {
+      case _statusOk:
+        return body;
+      case _statusIncorrectMac:
+        throw SecretBoxAuthenticationError();
+      case _statusIncorrectPadding:
+        throw SecretBoxPaddingError(message: utf8.decode(body));
+      case _statusUnsupported:
+        throw UnsupportedError(utf8.decode(body));
+      default:
+        throw PlatformException(code: 'DECRYPT_FAILED', message: utf8.decode(body));
+    }
+  }
 
   @protected
   static Future<List<int>> decryptWithPlugin({
@@ -83,21 +150,34 @@ abstract class FlutterCipher
       size: cipherTextSize,
     );
     await lock.lock();
-    late Map result;
+    late Uint8List clearText;
     try {
-      final cipherTextUint8List = asUint8List(secretBox.cipherText);
-      result = await invokeMethod(
-        'decrypt',
-        {
-          'algo': name,
-          'data': cipherTextUint8List,
-          'key': secretKeyUint8List,
-          'nonce': nonceUint8List,
-          'mac': macUint8List,
-          'aad': aadUint8List,
-        },
-        useQueue: false, // We do queueing ourselves
+      final raw = await _decryptRaw(
+        name: name,
+        secretKey: secretKeyUint8List,
+        nonce: nonceUint8List,
+        aad: aadUint8List,
+        cipherText: secretBox.cipherText,
+        mac: macUint8List,
       );
+      if (raw != null) {
+        clearText = raw;
+      } else {
+        final cipherTextUint8List = asUint8List(secretBox.cipherText);
+        final result = await invokeMethod(
+          'decrypt',
+          {
+            'algo': name,
+            'data': cipherTextUint8List,
+            'key': secretKeyUint8List,
+            'nonce': nonceUint8List,
+            'mac': macUint8List,
+            'aad': aadUint8List,
+          },
+          useQueue: false, // We do queueing ourselves
+        );
+        clearText = result['clearText'] as Uint8List;
+      }
     } on UnsupportedError {
       if (fallback == null) {
         rethrow;
@@ -123,8 +203,6 @@ abstract class FlutterCipher
     } finally {
       lock.unlock();
     }
-
-    final clearText = result['clearText'] as Uint8List;
 
     // Sanity check
     if (cipherTextSize != cipher.cipherTextLength(clearText.length)) {
